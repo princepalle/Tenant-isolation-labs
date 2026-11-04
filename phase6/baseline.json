@@ -1,0 +1,8 @@
+{
+  "accuracy": 1.0,
+  "by_tenant": {
+    "hospital": 1.0,
+    "bank": 1.0,
+    "lawfirm": 1.0
+  }
+}

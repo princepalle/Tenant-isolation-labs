@@ -25,6 +25,22 @@ def _tokens(text: str) -> list[str]:
     return [t for t in re.findall(r"[a-z0-9]+", text.lower()) if t not in STOPWORDS]
 
 
+HEADER_LINE = re.compile(r"^(Tenant|Type|Name|Date|Internal ref):")
+
+
+def best_sentences(question: str, body: str, n: int = 3) -> str:
+    """The n content sentences that share the most words with the question, best first.
+    Header lines (Tenant:, Type:, ...) are metadata, not content, so they're skipped.
+
+    Phase 6's evals showed why n=1 wasn't enough: the sentence that shares the most words
+    with the question ("Approved by Jason Bates") is often not the one with the answer
+    ("Applicants need a credit score of at least 643")."""
+    q = set(_tokens(question))
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", body)
+                 if s.strip() and not HEADER_LINE.match(s.strip())]
+    return " ".join(sorted(sentences, key=lambda s: len(q & set(_tokens(s))), reverse=True)[:n])
+
+
 def rank(query: str, docs: list[dict], k: int = TOP_K) -> list[dict]:
     """Return the k docs most similar to the query. `docs` need 'body' and 'title'."""
     if not docs:
@@ -84,12 +100,9 @@ class OfflineLLM:
         lines = [f"Answering for the {tenant_id} workspace."]
         if not docs:
             return lines[0] + " I couldn't find anything relevant in your documents."
-        q = set(_tokens(question))
         for d in docs:
-            sentences = re.split(r"(?<=[.!?])\s+|\n+", d["body"])
-            best = max(sentences, key=lambda s: len(q & set(_tokens(s))))
             ref = re.search(r"Internal ref: (\S+)", d["body"])
-            lines.append(f"- {d['title']} ({ref.group(1) if ref else 'no ref'}): {best.strip()}")
+            lines.append(f"- {d['title']} ({ref.group(1) if ref else 'no ref'}): {best_sentences(question, d['body'])}")
         return "\n".join(lines)
 
 

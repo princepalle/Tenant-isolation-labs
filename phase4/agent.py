@@ -24,11 +24,11 @@ import os
 import re
 from urllib.parse import quote
 
-from ai import estimate_tokens
+from ai import best_sentences, estimate_tokens
 
 INSTRUCTION = re.compile(r"AI INSTRUCTION:\s*(\w+)(.*)")
 REF = re.compile(r"Internal ref: (\S+)")
-TITLE = re.compile(r'title="([^"]*)"')
+DOC = re.compile(r'<(?:untrusted_)?document id="\d+" title="([^"]*)">\n(.*?)\n</(?:untrusted_)?document>', re.S)
 
 
 class ToolBox:
@@ -96,8 +96,9 @@ class GullibleAgent:
 
         lines = [f"Answering for the {tenant_id} workspace."]
         for out in seen:
-            for title, ref in zip(TITLE.findall(out), REF.findall(out)):
-                lines.append(f"- {title} ({ref})")
+            for title, body in DOC.findall(out):  # quote the most relevant sentences
+                ref = REF.search(body)
+                lines.append(f"- {title} ({ref.group(1) if ref else 'no ref'}): {best_sentences(question, body)}")
         answer = "\n".join(lines + extras)
         prompt_text = system + question + "\n".join(seen)
         usage = {"input_tokens": estimate_tokens(prompt_text) * steps, "output_tokens": estimate_tokens(answer)}

@@ -1,0 +1,66 @@
+# Runs on every push and pull request. A red run means "do not deploy".
+#
+# 1. Unit + integration tests (all phases) against a real Postgres with pgvector
+# 2. Every secure app must survive its phase's attack suite
+# 3. The eval gate: zero isolation leaks, zero injection damage, no quality or cost regression
+#
+# Uses the free offline models only. No API key, no cost, same result every run.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres   # throwaway CI database, not a real secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set up the database
+        run: python -m phase5.setup_db
+
+      - name: Tests (all phases)
+        run: pytest -q
+
+      - name: Attack suites (secure apps must have zero leaks)
+        run: |
+          python leak_hunter.py secure
+          python -m phase2.hunt secure
+          python -m phase3.hunt secure
+          python -m phase4.hunt secure
+          python -m phase5.hunt secure
+
+      - name: Eval gate
+        run: python -m phase6.evals --gate --report eval-report.md
+
+      - name: Publish the eval report
+        if: always()
+        run: |
+          if [ -f eval-report.md ]; then cat eval-report.md >> "$GITHUB_STEP_SUMMARY"; fi
