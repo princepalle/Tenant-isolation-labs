@@ -31,6 +31,7 @@ If a hospital user ever sees `BANK-SECRET-…`, that's a leak, with no room for 
 | `attacks.py` | One attack per leak, run as `hospital-alice` against the other tenants |
 | `leak_hunter.py` | Runs all attacks and prints a LEAK/safe report |
 | `tests/` | The secure app must pass every attack, the vulnerable app must fail every one, and both must still work |
+| `phase2/` | Postgres + Row-Level Security + pgvector. See the Phase 2 section below. |
 
 ## Setup
 
@@ -116,14 +117,89 @@ To start over, run `git checkout vulnerable_app.py`.
 
 Look at `TenantRepo` in `secure_app.py`. Route handlers never write SQL. They get a repository already bound to the caller's tenant, and it has no unscoped method. That includes the AI path: `retrieval_corpus()` only returns the tenant's own documents. **Make the safe path the only path.**
 
+## Phase 2: the database enforces isolation (Postgres + RLS + pgvector)
+
+In Phase 1, isolation depended on every developer remembering `WHERE tenant_id = ?` in every query. Phase 2 moves the rule **into the database** with Row-Level Security. Even a query with no tenant filter only sees the current tenant's rows.
+
+### Setup
+
+```bash
+docker compose up -d            # Postgres 16 + pgvector
+python -m phase2.setup_db       # roles, schema, RLS policies, 60 docs with embeddings
+python -m phase2.rls_demo       # 6 RLS pitfalls, live
+python -m phase2.hunt           # 11 attacks vs. the leaky and secure Phase 2 apps
+pytest -q                       # 47 tests (the Phase 2 ones skip if Postgres isn't running)
+```
+
+Run the servers with `uvicorn phase2.leaky_app:app --port 8003` and `uvicorn phase2.secure_app:app --port 8004`.
+
+### What's in `phase2/`
+
+| File | What it is |
+|---|---|
+| `schema.sql` | **Start here.** Tables, the RLS policies, the `auth_user()` function, and grants. Every line is commented. |
+| `db.py` | Connection settings and `tenant_session()`, which scopes one transaction to one tenant |
+| `embeddings.py` | Text into a 256-number vector for pgvector (offline feature hashing; swap in a real model later) |
+| `setup_db.py` | Creates the roles and database, then loads the same 60 documents as Phase 1 |
+| `leaky_app.py` | Phase 1's leaky code with **every tenant filter removed**, relying on RLS alone |
+| `secure_app.py` | Defense in depth: app-level fixes **and** RLS |
+| `rls_demo.py` | Six RLS pitfalls you can run and read |
+| `hunt.py` | Runs all 11 attacks against both apps on a fresh database |
+
+### How it works
+
+1. **Two database roles.** `lab_owner` owns the tables and has `BYPASSRLS` (migrations and seeding only). `app_user` is what the web app uses: it owns nothing and has `NOBYPASSRLS`, so policies always apply.
+2. **One policy per table**, e.g. `USING (tenant_id = current_setting('app.tenant_id', true))`. `USING` controls what you can read. `WITH CHECK` controls what you can write.
+3. **Each request runs one transaction** that starts with `set_config('app.tenant_id', <tenant from the token>, true)`. The `true` makes the setting vanish when the transaction ends.
+4. **Vector search is just SQL** (`ORDER BY embedding <=> query LIMIT 3`), so RLS applies to RAG retrieval automatically.
+
+### Results: what RLS catches on its own
+
+| Leak | RLS alone (leaky code) | Why |
+|---|---|---|
+| 1 IDOR | ✅ stopped | Foreign rows are invisible |
+| 2 Client-chosen tenant | ❌ leaks | RLS enforces whatever tenant the app sets. Garbage in, garbage out. |
+| 3 SQLi `OR 1=1` | ✅ stopped | The policy is applied on top of the injected WHERE clause |
+| 4 Search cache | ❌ leaks | The cache lives in the app, above the database |
+| 5 Path traversal | ❌ leaks | Files on disk aren't in the database |
+| 6 Mass assignment | ✅ stopped | `WITH CHECK` rejects the row (403) |
+| 7 Stats | ✅ stopped | The aggregates only see the tenant's own rows |
+| 8 RAG retrieval | ✅ stopped | Vector search is filtered by the policy |
+| 9 Chat history | ✅ stopped | The conversation and message policies are per user |
+| 10 Answer cache | ❌ leaks | App-level cache again |
+| **11 SQLi rewrites the tenant** | ❌ leaks | **New in Phase 2.** Injected SQL calls `set_config('app.tenant_id','bank',true)` and *becomes* the bank. |
+
+**5 of 11 still leak with RLS alone. 0 of 11 leak with the secure app.** RLS is a strong second lock, not a replacement for correct app code.
+
+### The RLS pitfalls (`python -m phase2.rls_demo`)
+
+1. **Fails closed.** No tenant set means 0 rows. That's good: a forgotten setting gives you an empty page, not a breach.
+2. **Vector search is scoped.** Similarity search with no `WHERE` still only returns the tenant's own documents.
+3. **The owner bypasses RLS.** Connected as `lab_owner`, you see all 60 rows. Superusers always bypass too. **The #1 RLS mistake is the app connecting as the table owner or a superuser.** Everything looks fine in testing, and nothing is enforced.
+4. **Connection pools leak settings.** A plain `SET app.tenant_id` sticks to the connection, and the next request on that pooled connection inherits it (20 bank rows). `SET LOCAL` / `set_config(..., true)` doesn't (0 rows). PgBouncer in transaction mode makes this worse.
+5. **`WITH CHECK` blocks cross-tenant writes**, even when the app code tries.
+6. **The users table is locked.** The app can't `SELECT` it, only call `auth_user()`, a narrow `SECURITY DEFINER` function.
+
+### Lesson from leak 11: test with several payloads
+
+A simple injection payload *sometimes* escapes the tenant and sometimes doesn't. It depends on whether Postgres reads the tenant index, which evaluates `current_setting()` once before the injected code runs, or scans rows, which re-evaluates it per row. The plan changes with table statistics. Attack 11 uses a payload that works under both plans. **"I tried the attack and it didn't work" proves nothing.**
+
+### Phase 2 exercises
+
+1. In `phase2/leaky_app.py`, fix the 5 leaks that remain (2, 4, 5, 10, 11). Run `python -m phase2.hunt leaky` after each fix.
+2. Break it on purpose: change `true` to `false` in `tenant_session()` (`db.py`) and run the tests. Which ones catch it? (Hint: probably none of the attack tests. Why? What test would?)
+3. Change `APP_DSN` to the owner's credentials and run `python -m phase2.hunt leaky`. Watch RLS silently stop working.
+4. **Harden against leak 11 at the database level:** `REVOKE EXECUTE ON FUNCTION set_config(text, text, boolean) FROM PUBLIC`, then add a `SECURITY DEFINER` function `set_tenant(token_hash)` that looks up the tenant itself. Now injected SQL can't choose a tenant without a valid token. What else would you need to change?
+5. Swap the embeddings for a real model (`embeddings.py` explains where), and change `vector(256)` to match its size.
+
 ## Roadmap to production
 
-You're at **Phase 1**. Each phase adds one production concern, with leaks to find and tests to prove the fix.
+You've done **Phases 1 and 2**. Each phase adds one production concern, with leaks to find and tests to prove the fix.
 
 | Phase | Topic | What you'd build and learn |
 |---|---|---|
 | ✅ 1 | **Isolation basics + RAG** | This lab: 10 leaks, an attack suite and tests |
-| 2 | **Database-enforced isolation** | Postgres + **Row-Level Security** + `pgvector` (Docker is available). Even a forgotten `WHERE` can't leak, because the DB refuses. Real embeddings instead of TF-IDF. |
+| ✅ 2 | **Database-enforced isolation** | Postgres + **Row-Level Security** + `pgvector`. See the Phase 2 section above. |
 | 3 | **Per-tenant limits and cost** | Rate limits and monthly token quotas per tenant ("noisy neighbor" protection). Record `usage.input_tokens`/`output_tokens` per request so you can bill each tenant. |
 | 4 | **Prompt injection** | A document that says "ignore your instructions…". Learn what isolation does and doesn't protect you from (it limits the blast radius to one tenant). Add output checks for canaries. |
 | 5 | **Observability and audit** | Structured logs with `tenant_id` on every line, but **no document contents in logs**. An audit trail of who asked what. Traces for each `/ask`. |

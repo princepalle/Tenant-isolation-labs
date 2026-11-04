@@ -138,13 +138,32 @@ def make_doc(fake: Faker, tenant: str, i: int) -> dict:
     }
 
 
-def seed(db_path=DEFAULT_DB, data_dir=DEFAULT_DATA, seed_value=1234) -> None:
-    db_path, data_dir = Path(db_path), Path(data_dir)
-    db_path.unlink(missing_ok=True)
-    shutil.rmtree(data_dir, ignore_errors=True)
-
+def generate_docs(seed_value=1234):
+    """Yield every document in insert order. Phase 2 (Postgres) uses this too, so both
+    phases have identical data."""
     fake = Faker()
     Faker.seed(seed_value)  # same data every run
+    # Interleave tenants so IDs are mixed: 1=hospital, 2=bank, 3=lawfirm, 4=hospital...
+    # That's how real shared tables look, and it's what makes ID-guessing attacks work.
+    for i in range(DOCS_PER_TENANT):
+        for tenant in TENANTS:
+            yield make_doc(fake, tenant, i)
+
+
+def write_files(docs, data_dir) -> None:
+    data_dir = Path(data_dir)
+    shutil.rmtree(data_dir, ignore_errors=True)
+    for doc in docs:
+        folder = data_dir / doc["tenant_id"]
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / doc["file_name"]).write_text(doc["body"])
+
+
+def seed(db_path=DEFAULT_DB, data_dir=DEFAULT_DATA, seed_value=1234) -> None:
+    db_path = Path(db_path)
+    db_path.unlink(missing_ok=True)
+    docs = list(generate_docs(seed_value))
+    write_files(docs, data_dir)
 
     conn = connect(db_path)
     conn.executescript(SCHEMA)
@@ -154,19 +173,11 @@ def seed(db_path=DEFAULT_DB, data_dir=DEFAULT_DATA, seed_value=1234) -> None:
         [(tok, name, tenant) for tok, (name, tenant) in USERS.items()],
     )
 
-    # Interleave tenants so IDs are mixed: 1=hospital, 2=bank, 3=lawfirm, 4=hospital...
-    # That's how real shared tables look, and it's what makes ID-guessing attacks work.
-    for i in range(DOCS_PER_TENANT):
-        for tenant in TENANTS:
-            doc = make_doc(fake, tenant, i)
-            conn.execute(
-                "INSERT INTO documents (tenant_id, doc_type, title, created, body, file_name)"
-                " VALUES (:tenant_id, :doc_type, :title, :created, :body, :file_name)",
-                doc,
-            )
-            folder = data_dir / tenant
-            folder.mkdir(parents=True, exist_ok=True)
-            (folder / doc["file_name"]).write_text(doc["body"])
+    conn.executemany(
+        "INSERT INTO documents (tenant_id, doc_type, title, created, body, file_name)"
+        " VALUES (:tenant_id, :doc_type, :title, :created, :body, :file_name)",
+        docs,
+    )
     conn.commit()
     conn.close()
 

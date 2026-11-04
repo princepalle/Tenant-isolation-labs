@@ -21,15 +21,15 @@ from seed import seed
 APPS = {"vulnerable": vulnerable_app, "secure": secure_app}
 
 
-def run(client, label: str) -> int:
+def run(client, attack_list=ALL_ATTACKS, label: str = "") -> int:
     print(f"\n=== {label} ===")
     leaks = 0
-    for attack in ALL_ATTACKS:
+    for attack in attack_list:
         f = attack(client)
         leaks += f.leaked
         status = "LEAK " if f.leaked else "safe "
         print(f"  [{status}] {f.leak}. {f.name:<32} {f.evidence}")
-    print(f"  -> {leaks} of {len(ALL_ATTACKS)} attacks leaked data")
+    print(f"  -> {leaks} of {len(attack_list)} attacks leaked data")
     return leaks
 
 
@@ -41,7 +41,7 @@ def main() -> int:
 
     if args.url:
         with httpx.Client(base_url=args.url) as client:
-            return 1 if run(client, args.url) else 0
+            return 1 if run(client, label=args.url) else 0
 
     total = 0
     for name in APPS if args.app == "both" else [args.app]:
@@ -49,7 +49,7 @@ def main() -> int:
             seed(Path(tmp) / "lab.db", Path(tmp) / "data")
             app = APPS[name].create_app(Path(tmp) / "lab.db", Path(tmp) / "data", llm=ai.get_llm())
             with TestClient(app) as client:
-                total += run(client, f"{name}_app.py")
+                total += run(client, label=f"{name}_app.py")
     return 1 if total else 0
 
 
