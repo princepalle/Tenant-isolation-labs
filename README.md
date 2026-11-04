@@ -37,7 +37,8 @@ If a hospital user ever sees `BANK-SECRET-…`, that's a leak, with no room for 
 ## Setup
 
 ```bash
-cd tenant-isolation-lab
+git clone https://github.com/princepalle/Tenant-isolation-labs.git
+cd Tenant-isolation-labs
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python seed.py
