@@ -25,11 +25,11 @@ APPS = {"leaky": leaky_app, "secure": secure_app}
 @contextmanager
 def fresh_client(name: str, data_dir=None):
     reset_and_seed(**({"data_dir": data_dir} if data_dir else {}))
-    with make_pool() as pool, make_pool(OWNER_DSN, size=2) as service:
+    with make_pool() as pool, make_pool(OWNER_DSN, size=2) as service, make_pool(size=3) as side:
         if name == "secure":
-            app = secure_app.create_app(pool=pool, agent=GullibleAgent())
+            app = secure_app.create_app(pool=pool, agent=GullibleAgent(), side_pool=side)
         else:
-            app = leaky_app.create_app(pool=pool, service_pool=service, agent=GullibleAgent())
+            app = leaky_app.create_app(pool=pool, service_pool=service, agent=GullibleAgent(), side_pool=side)
         with TestClient(app, raise_server_exceptions=False) as client:
             yield client
 

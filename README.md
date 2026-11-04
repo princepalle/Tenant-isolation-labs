@@ -34,6 +34,7 @@ If a hospital user ever sees `BANK-SECRET-…`, that's a leak, with no room for 
 | `phase2/` | Postgres + Row-Level Security + pgvector. See the Phase 2 section below. |
 | `phase3/` | Rate limits, quotas, usage metering and billing. See the Phase 3 section below. |
 | `phase4/` | An AI agent with tools vs. prompt injection. See the Phase 4 section below. |
+| `phase5/` | Logging and a tamper-evident audit trail. See the Phase 5 section below. |
 
 ## Setup
 
@@ -131,7 +132,7 @@ docker compose up -d            # Postgres 16 + pgvector
 python -m phase2.setup_db       # roles, schema, RLS policies, 60 docs with embeddings
 python -m phase2.rls_demo       # 6 RLS pitfalls, live
 python -m phase2.hunt           # 11 attacks vs. the leaky and secure Phase 2 apps
-pytest -q                       # 75 tests (the database ones skip if Postgres isn't running)
+pytest -q                       # 92 tests (the database ones skip if Postgres isn't running)
 ```
 
 Run the servers with `uvicorn phase2.leaky_app:app --port 8003` and `uvicorn phase2.secure_app:app --port 8004`.
@@ -319,9 +320,79 @@ Tenant isolation **limits the blast radius**. In the secure app, a hijacked hosp
 4. **Approval fatigue.** If people approve 50 drafts a day, they'll stop reading them. How would you show the approver what matters, like "this email contains 3 internal refs"?
 5. **Try real Claude.** Run with `LAB_LLM=claude`, plant a document with a plain-English injection, and ask the agent about it. Then remove the `<untrusted_document>` rule from `system_prompt()` and try again.
 
+## Phase 5: logging and audit trails
+
+When something goes wrong, you need to answer **"what happened, to which tenant, and who did it?"** But logs and audit trails are data too. They're shipped to third-party tools, kept for years, and read by many people. Done badly, they become the leak.
+
+### Setup
+
+```bash
+python -m phase5.setup_db     # Phase 4 database + audit tables + the auditor role
+python -m phase5.hunt         # 5 checks vs. the leaky and secure Phase 5 apps
+```
+
+Servers: `uvicorn phase5.leaky_app:app --port 8009` and `uvicorn phase5.secure_app:app --port 8010`. Set `LAB_LOG_LEVEL=INFO` to watch every log line live.
+Platform views: `curl -H "Authorization: Bearer platform-admin-dev" localhost:8010/admin/audit/verify` (and `/admin/security-events`).
+
+### Logs vs. audit trail
+
+| | Logs | Audit trail |
+|---|---|---|
+| For | Engineers debugging | Security, compliance, the customer |
+| Where | Log platform (stdout → collector) | `audit_events` table |
+| Completeness | Can be sampled, rotated, dropped | Must be complete, **including denied actions** |
+| Who can read | Your engineers | Each tenant sees its own; the `auditor` role sees all |
+| Can it change? | Doesn't matter much | Append-only and **tamper-evident** |
+
+### What's in `phase5/`
+
+| File | What it is |
+|---|---|
+| `schema.sql` | `audit_events` with RLS and a **hash chain**, `audit_append()` (the only way to write), the `auditor` role, and the leaky `activity_log` |
+| `obs.py` | JSON logs with `request_id`/`tenant_id`/`user` on every line, redaction, and `X-Request-ID` middleware |
+| `audit.py` | `record()` (own transaction) and `verify_chain()` (recomputes every hash) |
+| `leaky_app.py` / `secure_app.py` | The Phase 4 agent with leaky vs. careful logging and auditing |
+| `checks.py` / `hunt.py` | One check per problem |
+
+### The 5 problems
+
+| # | Problem (leaky app) | Fix (secure app) |
+|---|---|---|
+| 21 | **Content in logs:** "temporary" debug lines log the document body, the question and the full answer | Log **metadata**: ids, sizes, tool names, token counts, durations. A redaction filter catches doc refs, credentials and email addresses that slip through anyway. |
+| 22 | **No context:** plain-text lines, no request ID, no tenant | JSON lines with `request_id`, `tenant_id` and `user`. `X-Request-ID` is returned to the user, so a support ticket leads straight to the right logs and audit rows. |
+| 23 | **Shared activity log:** no RLS, no tenant filter. Every tenant sees everyone's activity. | `audit_events` has RLS. `/activity` shows only your tenant's rows. |
+| 24 | **Editable history:** the app role can `UPDATE`/`DELETE` `activity_log`, and nothing notices | The app role can only call `audit_append()`. Each row stores `sha256(previous hash + this row)`, and `/admin/audit/verify` recomputes the chain, catching edited, deleted or reordered rows. |
+| 25 | **Lost denials:** activity is written in the request's transaction, so when the request fails (404, 429) the rollback erases the record of the attempt | `audit.record()` writes in **its own transaction**. Denied and blocked actions are recorded: refused emails, rate limits, output-guard blocks, cross-tenant attempts. |
+
+### How the hash chain works
+
+```
+row 1: hash1 = sha256("genesis" | tenant | user | action | ... | time)
+row 2: hash2 = sha256(hash1     | tenant | user | action | ... | time)
+row 3: hash3 = sha256(hash2     | ...)
+```
+
+Change anything in row 2 and its hash no longer matches, and neither does any row after it. The `audit_heads` table holds each tenant's latest hash. Locking that row makes concurrent writes take turns, so the chain never forks (`test_concurrent_writes_keep_the_chain_intact` checks this with 20 parallel requests).
+
+**What it can't stop:** someone with owner rights who rewrites the whole chain *and* the head. The fix is to copy the head hash somewhere they can't reach, every hour (exercise 3).
+
+### The bug Phase 5 found (in Phases 3 and 4)
+
+Under concurrent load, the secure app froze and requests failed after 30 seconds. **A connection-pool deadlock:** each request holds a pooled connection for its transaction, and metering (Phase 3) and auditing (Phase 5) borrowed a *second* connection from the *same* pool. With more requests in flight than connections, every request held one connection while waiting for another that would never be free.
+
+The fix: writes that must outlive the request use a **separate side pool**, so a request can never wait on its own pool. It's now applied to the Phase 3, 4 and 5 apps, with regression tests that send 24 concurrent requests. With the old wiring, 22 of 24 fail. Lesson: *a test suite that only sends one request at a time can't find concurrency bugs.*
+
+### Phase 5 exercises
+
+1. Fix the 5 problems in `phase5/leaky_app.py`. Run `python -m phase5.hunt leaky` after each one.
+2. **Find the request.** Run the secure server with `LAB_LOG_LEVEL=INFO`, plant an injection (Phase 4) and trigger it. Using only the `X-Request-ID` from the response, find every log line *and* audit row for that request.
+3. **Anchor the chain.** Write a job that copies each tenant's `audit_heads.last_hash` to a place the database owner can't edit (a file in another system, an object store with retention lock). Extend `verify_chain()` to compare against it. Now try rewriting the whole chain as the owner.
+4. **Tenant export.** Customers often ask for their own audit log. Add `GET /activity/export` that returns the tenant's full chain *plus* the hashes, so the customer can verify it themselves.
+5. **Retention.** Logs and audit rows can't be kept forever (privacy laws), yet the chain links every row. How would you delete rows older than a year without breaking verification? (Hint: checkpoints.)
+
 ## Roadmap to production
 
-You've done **Phases 1 to 4**. Each phase adds one production concern, with leaks to find and tests to prove the fix.
+You've done **Phases 1 to 5**. Each phase adds one production concern, with leaks to find and tests to prove the fix.
 
 | Phase | Topic | What you'd build and learn |
 |---|---|---|
@@ -329,6 +400,6 @@ You've done **Phases 1 to 4**. Each phase adds one production concern, with leak
 | ✅ 2 | **Database-enforced isolation** | Postgres + **Row-Level Security** + `pgvector`. See the Phase 2 section above. |
 | ✅ 3 | **Per-tenant limits and cost** | Rate limits, quotas, metering and billing. See the Phase 3 section above. |
 | ✅ 4 | **Prompt injection** | An agent with tools, attacked by planted documents. See the Phase 4 section above. |
-| 5 | **Observability and audit** | Structured logs with `tenant_id` on every line, but **no document contents in logs**. An audit trail of who asked what. Traces for each `/ask`. |
+| ✅ 5 | **Observability and audit** | Structured logs, a tamper-evident audit trail, denied actions recorded. See the Phase 5 section above. |
 | 6 | **Evals** | An eval set per tenant: answer quality *and* isolation (did any answer contain a foreign canary?). Run it in CI before every deploy. |
 | 7 | **Ship it** | Docker Compose, real auth (JWT/OIDC with a tenant claim), secrets management, CI that runs `pytest` + `leak_hunter`, and per-tenant data export and deletion. |

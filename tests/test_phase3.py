@@ -87,3 +87,16 @@ def test_usage_ledger_is_append_only(tmp_path):
         conn.execute("SELECT set_config('app.tenant_id', 'hospital', true)")
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("DELETE FROM usage_events")
+
+
+@needs_pg
+def test_concurrent_requests_do_not_deadlock_the_pool(tmp_path):
+    """Regression test: metering used to borrow a 2nd connection from the request pool,
+    which deadlocked as soon as more requests were in flight than the pool had connections."""
+    from concurrent.futures import ThreadPoolExecutor
+    with fresh_client("secure", tmp_path / "data") as c:
+        def ask(i):
+            return c.post("/ask", json={"question": f"loan policy {i}"}, headers=auth("bank-bob")).status_code
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            assert set(pool.map(ask, range(24))) == {200}
+        assert c.get("/usage", headers=auth("bank-bob")).json()["by_user"][0]["calls"] == 24

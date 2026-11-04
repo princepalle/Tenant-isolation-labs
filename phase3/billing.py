@@ -28,8 +28,8 @@ def simulate(per_user: int) -> dict[str, int]:
     reset_and_seed()
     blocked: dict[str, int] = {}
     rng = random.Random(7)
-    with make_pool() as pool, make_pool(BILLING_DSN, size=2) as billing:
-        app = secure_app.create_app(pool=pool, billing_pool=billing, llm=ai.OfflineLLM())
+    with make_pool() as pool, make_pool(BILLING_DSN, size=2) as billing, make_pool(size=3) as side:
+        app = secure_app.create_app(pool=pool, billing_pool=billing, llm=ai.OfflineLLM(), side_pool=side)
         with TestClient(app, raise_server_exceptions=False) as client:
             for i in range(per_user):
                 for token, (_, tenant) in USERS.items():

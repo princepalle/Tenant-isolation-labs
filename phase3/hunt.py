@@ -23,9 +23,10 @@ APPS = {"leaky": leaky_app, "secure": secure_app}
 def fresh_client(name: str, data_dir=None):
     """A reset database, new pools, and a new app (so rate limit buckets start full)."""
     reset_and_seed(**({"data_dir": data_dir} if data_dir else {}))
-    with make_pool() as pool, make_pool(BILLING_DSN, size=2) as billing, make_pool(OWNER_DSN, size=2) as owner:
+    with make_pool() as pool, make_pool(BILLING_DSN, size=2) as billing, make_pool(OWNER_DSN, size=2) as owner, \
+            make_pool(size=3) as side:
         if name == "secure":
-            app = secure_app.create_app(pool=pool, billing_pool=billing, llm=ai.OfflineLLM())
+            app = secure_app.create_app(pool=pool, billing_pool=billing, llm=ai.OfflineLLM(), side_pool=side)
         else:
             app = leaky_app.create_app(pool=pool, owner_pool=owner, llm=ai.OfflineLLM())
         with TestClient(app, raise_server_exceptions=False) as client:

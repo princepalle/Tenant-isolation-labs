@@ -104,12 +104,16 @@ class SecureTools(ToolBox):
         raise ValueError(f"Unknown tool {name}")
 
 
-def create_app(pool=None, agent=None, limiter=None) -> FastAPI:
+def create_app(pool=None, agent=None, limiter=None, side_pool=None) -> FastAPI:
     app = FastAPI(title="Phase 4: AI agent with tools (secure)")
     install_rls_error_handler(app)
     pool = pool or make_pool()
     agent = agent or get_agent()
-    gateway = LLMGateway(agent, pool, limiter or RateLimiter())
+    # Metering/audit writes need their own transaction, so they borrow a SECOND connection.
+    # From the same pool, that deadlocks under load: every request holds one connection
+    # while waiting for another. A separate side pool can't be starved by requests.
+    side_pool = side_pool or make_pool(size=3)
+    gateway = LLMGateway(agent, side_pool, limiter or RateLimiter())
 
     def current_user(authorization: str | None = Header(None), x_tenant_id: str | None = Header(None)):
         user = authenticate(pool, authorization)

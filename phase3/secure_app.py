@@ -20,12 +20,16 @@ from phase3.metering import LLMGateway, RateLimiter
 from phase3.setup_db import BILLING_DSN
 
 
-def create_app(pool=None, billing_pool=None, llm=None, limiter=None, admin_token=None) -> FastAPI:
+def create_app(pool=None, billing_pool=None, llm=None, limiter=None, admin_token=None, side_pool=None) -> FastAPI:
     app = FastAPI(title="Phase 3: limits, quotas and billing (secure)")
     install_rls_error_handler(app)
     pool = pool or make_pool()
     billing_pool = billing_pool or make_pool(BILLING_DSN, size=2)
-    gateway = LLMGateway(llm or ai.get_llm(), pool, limiter or RateLimiter())
+    # Metering/audit writes need their own transaction, so they borrow a SECOND connection.
+    # From the same pool, that deadlocks under load: every request holds one connection
+    # while waiting for another. A separate side pool can't be starved by requests.
+    side_pool = side_pool or make_pool(size=3)
+    gateway = LLMGateway(llm or ai.get_llm(), side_pool, limiter or RateLimiter())
     # Dev default only. In production this comes from a secrets manager.
     admin_token = admin_token or os.environ.get("LAB_ADMIN_TOKEN", "platform-admin-dev")
     answer_cache: dict = {}

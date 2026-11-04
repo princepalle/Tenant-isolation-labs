@@ -61,6 +61,8 @@ class LLMGateway:
     """The only way the secure app talks to a model."""
 
     def __init__(self, llm, pool, limiter: RateLimiter):
+        """`pool` is only used for usage writes. Give it a SEPARATE pool from the one requests
+        use, or concurrent requests deadlock (see Phase 5, "the bug Phase 5 found")."""
         self.llm, self.pool, self.limiter = llm, pool, limiter
 
     def plan(self, conn) -> dict:
