@@ -1,8 +1,6 @@
 # Tenant Isolation Lab
 
-A practice project for learning **how multi-tenant data leaks happen and how to stop them**.
-
-Three tenants share one database and one file store:
+A practice **multi-tenant AI SaaS**: three customer companies share one platform, one database and one AI assistant. The goal is to learn how to run that **production-ready**: how tenant data leaks, how to catch it, and how to design so it can't.
 
 | Tenant | Users (token) | Document types |
 |---|---|---|
@@ -13,16 +11,26 @@ Three tenants share one database and one file store:
 Every document has a canary line such as `Internal ref: BANK-SECRET-e282d63c6e`.
 If a hospital user ever sees `BANK-SECRET-…`, that's a leak, with no room for argument.
 
-## What's in here
+## Architecture (today)
+
+```
+ client ──Bearer token──▶ FastAPI app ──▶ TenantRepo (every query bound to one tenant)
+                              │                 │
+                              │                 ├─▶ SQLite: tenants, users, documents, conversations, messages
+                              │                 └─▶ data/<tenant>/*.txt
+                              │
+                              └─▶ /ask: retrieve (tenant-filtered) ─▶ prompt ─▶ LLM (offline or Claude)
+```
 
 | File | What it is |
 |---|---|
-| `seed.py` | Builds fake data: `lab.db` (SQLite) and `data/<tenant>/doc_N.txt`. The same data every run. |
-| `vulnerable_app.py` | A FastAPI app with **7 planted leaks**, each marked `# LEAK n:` |
+| `seed.py` | Builds fake data: `lab.db` and `data/<tenant>/doc_N.txt`. The same data every run. |
+| `ai.py` | The AI layer: a TF-IDF retriever (stands in for a vector DB), the prompt, and the model: `OfflineLLM` or `ClaudeLLM` |
+| `vulnerable_app.py` | The SaaS API with **10 planted leaks**, each marked `# LEAK n:` |
 | `secure_app.py` | The same API with every leak fixed. This is the answer key. |
 | `attacks.py` | One attack per leak, run as `hospital-alice` against the other tenants |
 | `leak_hunter.py` | Runs all attacks and prints a LEAK/safe report |
-| `tests/` | pytest suite: the secure app must pass every attack, and the vulnerable app must fail every one |
+| `tests/` | The secure app must pass every attack, the vulnerable app must fail every one, and both must still work |
 
 ## Setup
 
@@ -31,8 +39,8 @@ cd tenant-isolation-lab
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python seed.py
-python leak_hunter.py          # 7/7 leaks on vulnerable, 0/7 on secure
-pytest -q                      # 16 passed
+python leak_hunter.py          # 10/10 leaks on vulnerable, 0/10 on secure
+pytest -q                      # 23 passed
 ```
 
 To explore by hand, run a server and open its interactive docs:
@@ -40,8 +48,23 @@ To explore by hand, run a server and open its interactive docs:
 ```bash
 uvicorn vulnerable_app:app --port 8001 --reload   # http://localhost:8001/docs
 uvicorn secure_app:app     --port 8002 --reload   # http://localhost:8002/docs
+
 curl -H "Authorization: Bearer hospital-alice" localhost:8001/documents/2   # a bank doc!
+curl -X POST localhost:8001/ask -H "Authorization: Bearer hospital-alice" \
+     -H "Content-Type: application/json" -d '{"question": "What credit score do loan applicants need?"}'
 ```
+
+### Using real Claude
+
+By default the assistant is an **offline fake model**: free, instant and deterministic, so tests never cost money. To use Claude:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+LAB_LLM=claude uvicorn secure_app:app --port 8002
+# optional: LAB_CLAUDE_MODEL (default claude-opus-5-5), LAB_CLAUDE_EFFORT (default low)
+```
+
+Try leak 8 against the vulnerable app with Claude. It will *often* obey the "only use hospital documents" instruction, and sometimes it won't. Either way, the `sources` list hands the bank's documents back to the caller. A prompt is not a security boundary.
 
 ## How to practice
 
@@ -51,50 +74,58 @@ curl -H "Authorization: Bearer hospital-alice" localhost:8001/documents/2   # a 
 4. Run `python leak_hunter.py vulnerable` and watch the LEAK count drop.
 5. Only then compare your fix with `secure_app.py`.
 
-When you've fixed all 7, the hunter prints `0 of 7` for both apps. To start over, run `git checkout vulnerable_app.py`.
+To start over, run `git checkout vulnerable_app.py`.
 
-## The 7 leaks
+## The 10 leaks
 
-### 1. IDOR: guessable IDs, no ownership check
-`GET /documents/{id}` looks a row up by ID only. IDs are shared across tenants (1=hospital, 2=bank, 3=lawfirm…), so guessing numbers reads everyone's data.
-**Where it happens in real systems:** any "get by ID" endpoint, download links, and admin tools.
-**Fix:** put the tenant in the query itself: `WHERE id = ? AND tenant_id = ?`. Return **404**, not 403, for other tenants' IDs, because a 403 confirms the ID exists. Random UUIDs make guessing harder, but they don't replace the check.
+### Classic SaaS leaks
 
-### 2. Trusting a tenant ID from the client
-`GET /documents` uses an `X-Tenant-ID` header when one is sent. Headers, query params, cookies and request bodies are all controlled by the attacker.
-**Fix:** take the tenant only from the authenticated identity (the token or session). Reject any client hint that disagrees.
+**1. IDOR: guessable IDs, no ownership check.** `GET /documents/{id}` looks a row up by ID only. IDs are shared across tenants, so guessing numbers reads everyone's data.
+*Fix:* put the tenant in the query itself (`WHERE id = ? AND tenant_id = ?`). Return **404**, not 403, because a 403 confirms the ID exists.
 
-### 3. SQL injection removes the tenant filter
-`/search` pastes `q` into the SQL string, so `x%' OR 1=1 --` turns the query into "everything".
-**Fix:** always use parameterized queries. Here, the tenant filter was in the code but injection deleted it.
+**2. Trusting a tenant ID from the client.** `GET /documents` obeys an `X-Tenant-ID` header. Headers, params, cookies and bodies are all controlled by the attacker.
+*Fix:* the tenant comes only from the authenticated identity. Reject hints that disagree.
 
-### 4. Shared cache without the tenant in the key
-`/search` caches by query text only. When the bank searches "policy" first, the hospital's "policy" search returns the bank's cached results.
-**Where it happens in real systems:** Redis/memcached, CDN caches of authenticated pages, memoized functions, and **LLM/RAG answer caches**.
-**Fix:** every cache key includes the tenant, e.g. `(tenant_id, query)`.
+**3. SQL injection removes the tenant filter.** `/search` pastes `q` into SQL, so `x%' OR 1=1 --` returns everything.
+*Fix:* parameterized queries, always.
 
-### 5. Path traversal in file storage
-`/files?name=../bank/doc_0.txt` walks out of the hospital's folder.
-**Where it happens in real systems:** file downloads, S3 keys built from user input, and zip extraction.
-**Fix:** resolve the final path and check that it's still inside the tenant's root. Better still, look files up by a DB ID that's scoped to the tenant, and never take a raw filename.
+**4. Shared cache without the tenant in the key.** `/search` caches by query text, so tenants get each other's cached results.
+*Fix:* every cache key includes the tenant. This applies to Redis, CDNs and memoized functions.
 
-### 6. Mass assignment: writing into another tenant
-`POST /documents` accepts `tenant_id` in the body, so a hospital user can plant data in the bank's space. This is a **write** leak, and it's just as serious as a read leak.
-**Fix:** the request schema has no `tenant_id` field and rejects unknown fields. The server sets the tenant.
+**5. Path traversal in file storage.** `/files?name=../bank/doc_0.txt` escapes the tenant folder.
+*Fix:* resolve the path and check it's still inside the tenant's root. Better: look files up by a tenant-scoped ID.
 
-### 7. Unscoped aggregates
-`/stats` counts documents across all tenants. "It's only counts" still reveals who your other customers are and how big they are.
-**Where it happens in real systems:** dashboards, analytics, autocomplete, "recent activity" feeds, and search suggestions.
-**Fix:** scope aggregates like any other query.
+**6. Mass assignment: writing into another tenant.** `POST /documents` accepts `tenant_id` in the body.
+*Fix:* the request schema has no `tenant_id` and rejects unknown fields. The server sets the tenant.
+
+**7. Unscoped aggregates.** `/stats` counts every tenant's documents, which reveals who your other customers are and how big they are.
+*Fix:* scope aggregates like any other query.
+
+### AI-specific leaks
+
+**8. RAG retrieval across tenants.** `/ask` searches **all** tenants' documents, then tells the model "only use hospital documents". The model may or may not obey, and the `sources` list leaks anyway. In real systems this is a shared vector index queried without a metadata filter.
+*Fix:* filter by tenant **before** ranking, so the model never sees foreign data. With a vector DB, use a per-tenant namespace or collection, or a mandatory metadata filter in the query.
+
+**9. Chat history of another user/tenant.** Conversation IDs are `1, 2, 3…` with no ownership check, so anyone can read or *continue* someone else's chat. Continuing it pulls their history into the prompt.
+*Fix:* conversations belong to a tenant **and** a user, and every read checks both. UUIDs help but don't replace the check. (The secure app also stops colleagues inside a tenant from reading each other's chats; see `test_colleagues_cannot_read_each_others_chats`.)
+
+**10. Shared answer cache.** LLM calls are expensive, so teams cache answers. Keying the cache by question text alone serves the bank's answer to the hospital.
+*Fix:* cache key = `(tenant, question)`, and never cache answers that depend on a user's chat history.
 
 ## The pattern behind all the fixes
 
-Look at `TenantRepo` in `secure_app.py`. Route handlers never write SQL. They get a repository that's already bound to the caller's tenant, and that repository has no unscoped method. Fixing leaks one endpoint at a time doesn't hold up. **Make the safe path the only path.**
+Look at `TenantRepo` in `secure_app.py`. Route handlers never write SQL. They get a repository already bound to the caller's tenant, and it has no unscoped method. That includes the AI path: `retrieval_corpus()` only returns the tenant's own documents. **Make the safe path the only path.**
 
-## Next levels (when you're ready)
+## Roadmap to production
 
-- **Database-enforced isolation:** move to Postgres and turn on **Row-Level Security**, so that even a forgotten `WHERE` can't leak. This is the strongest single upgrade.
-- **Error messages and logs:** stack traces and log lines that include other tenants' data. Logs are often shared across tenants.
-- **Background jobs:** a worker that processes "all pending docs" without carrying the tenant along.
-- **RAG / vector search:** embed the documents and make sure retrieval filters by tenant metadata *before* ranking. A missing filter there is the AI version of leak 3/4.
-- **Write your own leak:** add a new endpoint with a subtle bug, write an attack for it in `attacks.py`, and make sure the tests catch it.
+You're at **Phase 1**. Each phase adds one production concern, with leaks to find and tests to prove the fix.
+
+| Phase | Topic | What you'd build and learn |
+|---|---|---|
+| ✅ 1 | **Isolation basics + RAG** | This lab: 10 leaks, an attack suite and tests |
+| 2 | **Database-enforced isolation** | Postgres + **Row-Level Security** + `pgvector` (Docker is available). Even a forgotten `WHERE` can't leak, because the DB refuses. Real embeddings instead of TF-IDF. |
+| 3 | **Per-tenant limits and cost** | Rate limits and monthly token quotas per tenant ("noisy neighbor" protection). Record `usage.input_tokens`/`output_tokens` per request so you can bill each tenant. |
+| 4 | **Prompt injection** | A document that says "ignore your instructions…". Learn what isolation does and doesn't protect you from (it limits the blast radius to one tenant). Add output checks for canaries. |
+| 5 | **Observability and audit** | Structured logs with `tenant_id` on every line, but **no document contents in logs**. An audit trail of who asked what. Traces for each `/ask`. |
+| 6 | **Evals** | An eval set per tenant: answer quality *and* isolation (did any answer contain a foreign canary?). Run it in CI before every deploy. |
+| 7 | **Ship it** | Docker Compose, real auth (JWT/OIDC with a tenant claim), secrets management, CI that runs `pytest` + `leak_hunter`, and per-tenant data export and deletion. |

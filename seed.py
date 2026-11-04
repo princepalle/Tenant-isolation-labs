@@ -23,6 +23,12 @@ CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT,
                         created TEXT NOT NULL, body TEXT NOT NULL,
                         file_name TEXT);
 CREATE INDEX documents_tenant ON documents(tenant_id);
+CREATE TABLE conversations (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id),
+                            user_name TEXT NOT NULL, created TEXT NOT NULL DEFAULT (datetime('now')));
+CREATE TABLE messages  (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                        content TEXT NOT NULL);
 """
 
 # Sentence templates per tenant/doc type. Fields are filled from `values()`.

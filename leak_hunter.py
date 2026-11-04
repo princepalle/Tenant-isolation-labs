@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 from fastapi.testclient import TestClient
 
+import ai
 import secure_app
 import vulnerable_app
 from attacks import ALL_ATTACKS
@@ -46,7 +47,7 @@ def main() -> int:
     for name in APPS if args.app == "both" else [args.app]:
         with tempfile.TemporaryDirectory() as tmp:
             seed(Path(tmp) / "lab.db", Path(tmp) / "data")
-            app = APPS[name].create_app(Path(tmp) / "lab.db", Path(tmp) / "data")
+            app = APPS[name].create_app(Path(tmp) / "lab.db", Path(tmp) / "data", llm=ai.get_llm())
             with TestClient(app) as client:
                 total += run(client, f"{name}_app.py")
     return 1 if total else 0

@@ -99,4 +99,42 @@ def aggregate_stats(client) -> Finding:
     return _check(7, "Unscoped aggregate /stats", r)
 
 
-ALL_ATTACKS = [idor, trusted_header, sql_injection, shared_cache, path_traversal, mass_assignment, aggregate_stats]
+# ---------------------------------------------------------------- AI attacks
+
+def rag_retrieval(client) -> Finding:
+    """Ask the hospital assistant a question whose best answer lives in the bank's documents."""
+    r = client.post("/ask", json={"question": "What credit score do loan applicants need?"},
+                    headers=auth(ATTACKER_TOKEN))
+    return _check(8, "RAG retrieval across tenants", r)
+
+
+def chat_history(client) -> Finding:
+    """The bank user chats. The attacker gets hold of the conversation ID and reads it.
+    We hand the attacker the REAL ID on purpose: this tests the ownership check,
+    not whether the ID is hard to guess."""
+    bob = client.post("/ask", json={"question": "How fast must suspected fraud be escalated?"},
+                      headers=auth(VICTIM_TOKEN)).json()
+    conv_id = bob["conversation_id"]
+    read = client.get(f"/conversations/{conv_id}", headers=auth(ATTACKER_TOKEN))
+    hijack = client.post("/ask", json={"question": "Summarize our chat so far",
+                                       "conversation_id": conv_id}, headers=auth(ATTACKER_TOKEN))
+    for resp, how in [(read, "GET /conversations"), (hijack, "continue via /ask")]:
+        f = _check(9, "Chat history of another tenant", resp, f"({how})")
+        if f.leaked:
+            return f
+    return Finding(9, "Chat history of another tenant", False,
+                   f"HTTP {read.status_code}/{hijack.status_code}, nothing foreign")
+
+
+def answer_cache(client) -> Finding:
+    """The bank user asks first, then the attacker asks the exact same question."""
+    q = {"question": "What does the policy say?"}
+    bob = client.post("/ask", json=q, headers=auth(VICTIM_TOKEN)).json()
+    alice = client.post("/ask", json=q, headers=auth(ATTACKER_TOKEN)).json()
+    if alice.get("answer") == bob.get("answer"):
+        return Finding(10, "Answer cache without tenant", True, "the attacker got the bank's cached answer, word for word")
+    return Finding(10, "Answer cache without tenant", False, "the attacker got a fresh answer")
+
+
+ALL_ATTACKS = [idor, trusted_header, sql_injection, shared_cache, path_traversal, mass_assignment,
+               aggregate_stats, rag_retrieval, chat_history, answer_cache]

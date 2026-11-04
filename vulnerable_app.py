@@ -1,4 +1,4 @@
-"""The LEAKY app. Seven tenant-isolation bugs are planted here on purpose.
+"""The LEAKY app. Ten tenant-isolation bugs (7 classic + 3 AI) are planted here on purpose.
 
 Each one is marked `# LEAK n:` and matches a section in README.md.
 Your exercise: fix them here, one at a time, and re-run `python leak_hunter.py vulnerable`
@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
+import ai
 from common import DEFAULT_DATA, DEFAULT_DB, connect, require_user
 
 
@@ -22,9 +23,16 @@ class NewDocument(BaseModel):
     tenant_id: str | None = None  # LEAK 6: the client gets to pick the tenant
 
 
-def create_app(db_path=DEFAULT_DB, data_dir=DEFAULT_DATA) -> FastAPI:
+class AskRequest(BaseModel):
+    question: str
+    conversation_id: str | None = None
+
+
+def create_app(db_path=DEFAULT_DB, data_dir=DEFAULT_DATA, llm=None) -> FastAPI:
     app = FastAPI(title="Tenant Lab: VULNERABLE")
     search_cache: dict = {}
+    answer_cache: dict = {}
+    llm = llm or ai.get_llm()
 
     def db():
         conn = connect(db_path)
@@ -105,6 +113,61 @@ def create_app(db_path=DEFAULT_DB, data_dir=DEFAULT_DATA) -> FastAPI:
             "SELECT tenant_id, doc_type, COUNT(*) AS n FROM documents GROUP BY tenant_id, doc_type"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ AI assistant
+
+    @app.post("/ask")
+    def ask(req: AskRequest, user=Depends(current_user), conn=Depends(db)):
+        # LEAK 10: answers are cached by question text alone, shared by every tenant.
+        if req.conversation_id is None and req.question in answer_cache:
+            return answer_cache[req.question]
+
+        # LEAK 9: loads whichever conversation ID it's given, and the IDs are just 1, 2, 3...
+        history = []
+        if req.conversation_id:
+            history = [dict(r) for r in conn.execute(
+                "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id",
+                (req.conversation_id,),
+            )]
+            conv_id = req.conversation_id
+        else:
+            conv_id = str(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] + 1)
+            conn.execute("INSERT INTO conversations (id, tenant_id, user_name) VALUES (?, ?, ?)",
+                         (conv_id, user["tenant_id"], user["name"]))
+
+        # LEAK 8: retrieval searches EVERY tenant's documents, then asks the model nicely
+        # to stay in its lane. The prompt is not a security boundary, and the sources
+        # list below hands the foreign docs straight back to the caller anyway.
+        all_docs = [dict(r) for r in conn.execute("SELECT id, tenant_id, title, body FROM documents")]
+        docs = ai.rank(req.question, all_docs)
+        system = ai.system_prompt(
+            user["tenant_id"],
+            f"Only use documents that belong to the {user['tenant_id']} tenant.",
+        )
+        answer = llm.answer(user["tenant_id"], system, history, req.question, docs)
+
+        conn.executemany("INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)",
+                         [(conv_id, "user", req.question), (conv_id, "assistant", answer)])
+        conn.commit()
+        result = {
+            "answer": answer,
+            "sources": [{"id": d["id"], "title": d["title"], "tenant_id": d["tenant_id"]} for d in docs],
+            "conversation_id": conv_id,
+            "model": llm.name,
+        }
+        if req.conversation_id is None:
+            answer_cache[req.question] = result
+        return result
+
+    @app.get("/conversations/{conv_id}")
+    def get_conversation(conv_id: str, user=Depends(current_user), conn=Depends(db)):
+        # LEAK 9 (again): no ownership check on reading a chat transcript.
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id", (conv_id,)
+        ).fetchall()
+        if not rows:
+            raise HTTPException(404, "Not found")
+        return {"id": conv_id, "messages": [dict(r) for r in rows]}
 
     return app
 

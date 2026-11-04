@@ -7,6 +7,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+import ai
 import secure_app
 import vulnerable_app
 from attacks import ALL_ATTACKS, ATTACKER_TOKEN, auth
@@ -18,7 +19,8 @@ def make_client(tmp_path):
     seed(tmp_path / "lab.db", tmp_path / "data")
 
     def _make(module):
-        return TestClient(module.create_app(tmp_path / "lab.db", tmp_path / "data"))
+        # Always the offline model in tests: free, fast and deterministic.
+        return TestClient(module.create_app(tmp_path / "lab.db", tmp_path / "data", llm=ai.OfflineLLM()))
 
     return _make
 
@@ -55,3 +57,19 @@ def test_legitimate_use_still_works(make_client, module):
     assert created.status_code == 201 and created.json()["tenant_id"] == "hospital"
 
     assert c.get("/documents").status_code == 401
+
+    # The AI assistant answers from the tenant's own documents and keeps a conversation going.
+    first = c.post("/ask", json={"question": "What is the staff policy for handovers?"}, headers=h).json()
+    assert first["sources"] and all(s["tenant_id"] == "hospital" for s in first["sources"])
+    assert "HOSPITAL-SECRET-" in first["answer"]
+    follow = c.post("/ask", json={"question": "And which ward?", "conversation_id": first["conversation_id"]}, headers=h)
+    assert follow.status_code == 200
+    convo = c.get(f"/conversations/{first['conversation_id']}", headers=h).json()
+    assert len(convo["messages"]) == 4
+
+
+def test_colleagues_cannot_read_each_others_chats(make_client):
+    """Same tenant, different user: isolation inside a tenant matters too."""
+    c = make_client(secure_app)
+    conv = c.post("/ask", json={"question": "staff policy"}, headers=auth("hospital-alice")).json()["conversation_id"]
+    assert c.get(f"/conversations/{conv}", headers=auth("hospital-hank")).status_code == 404
