@@ -82,18 +82,20 @@ class LLMGateway:
             " WHERE created >= date_trunc('month', now())"
         ).fetchone()["n"]
 
-    def answer(self, conn, tenant_id: str, user_name: str, system, history, question, docs) -> str:
+    def check_quota(self, conn) -> None:
         quota = self.plan(conn)["monthly_token_quota"]
         if self.tokens_used_this_month(conn) >= quota:
             # Known gap: two requests can both pass this check at the same moment and overshoot
             # the quota a little. See the Phase 3 exercises for the reservation fix.
             raise too_many("Monthly token quota used up. Upgrade your plan or wait for next month.", 3600)
 
+    def answer(self, conn, tenant_id: str, user_name: str, system, history, question, docs) -> str:
+        self.check_quota(conn)
         text, usage = self.llm.answer_with_usage(tenant_id, system, history, question, docs)
-        self._record(tenant_id, user_name, usage)
+        self.record(tenant_id, user_name, usage)
         return text
 
-    def _record(self, tenant_id: str, user_name: str, usage: dict) -> None:
+    def record(self, tenant_id: str, user_name: str, usage: dict) -> None:
         """Written in its OWN transaction. If the request fails after the model call
         (a bug, a timeout, a rolled-back insert), the model call still cost money,
         so the usage row must survive."""
