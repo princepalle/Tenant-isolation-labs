@@ -32,6 +32,7 @@ If a hospital user ever sees `BANK-SECRET-…`, that's a leak, with no room for 
 | `leak_hunter.py` | Runs all attacks and prints a LEAK/safe report |
 | `tests/` | The secure app must pass every attack, the vulnerable app must fail every one, and both must still work |
 | `phase2/` | Postgres + Row-Level Security + pgvector. See the Phase 2 section below. |
+| `phase3/` | Rate limits, quotas, usage metering and billing. See the Phase 3 section below. |
 
 ## Setup
 
@@ -128,7 +129,7 @@ docker compose up -d            # Postgres 16 + pgvector
 python -m phase2.setup_db       # roles, schema, RLS policies, 60 docs with embeddings
 python -m phase2.rls_demo       # 6 RLS pitfalls, live
 python -m phase2.hunt           # 11 attacks vs. the leaky and secure Phase 2 apps
-pytest -q                       # 47 tests (the Phase 2 ones skip if Postgres isn't running)
+pytest -q                       # 61 tests (the database ones skip if Postgres isn't running)
 ```
 
 Run the servers with `uvicorn phase2.leaky_app:app --port 8003` and `uvicorn phase2.secure_app:app --port 8004`.
@@ -192,15 +193,79 @@ A simple injection payload *sometimes* escapes the tenant and sometimes doesn't.
 4. **Harden against leak 11 at the database level:** `REVOKE EXECUTE ON FUNCTION set_config(text, text, boolean) FROM PUBLIC`, then add a `SECURITY DEFINER` function `set_tenant(token_hash)` that looks up the tenant itself. Now injected SQL can't choose a tenant without a valid token. What else would you need to change?
 5. Swap the embeddings for a real model (`embeddings.py` explains where), and change `vector(256)` to match its size.
 
+## Phase 3: fair limits and honest billing
+
+Phases 1 and 2 were about **data**. Phase 3 is about **fairness and money**. Every AI call costs you real money, and every tenant shares the same servers and model quota. Three questions every AI SaaS has to answer:
+
+1. **Can one tenant hurt the others?** (noisy neighbor)
+2. **Can a tenant use more than it pays for?** (limit evasion, missing quotas)
+3. **Does your bill from the model provider match what you charge customers?** (metering)
+
+### Setup
+
+```bash
+python -m phase3.setup_db              # Phase 2 database + plans, usage ledger, billing role
+python -m phase3.hunt                  # 5 checks vs. the leaky and secure Phase 3 apps
+python -m phase3.billing --simulate 40 # fake a burst of traffic, then print each tenant's invoice
+```
+
+Servers: `uvicorn phase3.leaky_app:app --port 8005` and `uvicorn phase3.secure_app:app --port 8006`.
+Admin view: `curl -H "Authorization: Bearer platform-admin-dev" localhost:8006/admin/usage`
+
+### Plans
+
+| Tenant | Plan | Requests / minute | Tokens / month |
+|---|---|---|---|
+| bank | enterprise | 120 | 5,000,000 |
+| hospital | pro | 30 | 500,000 |
+| lawfirm | free | 5 | 20,000 |
+
+### What's in `phase3/`
+
+| File | What it is |
+|---|---|
+| `schema.sql` | **Start here.** Plans, the `usage_events` ledger (append-only), RLS on `tenants`, and the `billing_reader` role |
+| `metering.py` | Prices, the token-bucket `RateLimiter`, and `LLMGateway`: **the only way the secure app calls a model** |
+| `leaky_app.py` | Five limit and billing mistakes, marked `# PROBLEM n:` |
+| `secure_app.py` | The fixed version, built on the Phase 2 secure app |
+| `checks.py` / `hunt.py` | One check per problem, each on a fresh database |
+| `billing.py` | Invoices for every tenant, read through the least-privilege billing role |
+
+### The 5 problems
+
+| # | Problem (leaky app) | What goes wrong | Fix (secure app) |
+|---|---|---|---|
+| 12 | **Noisy neighbor:** one global rate limit | The bank's burst of 70 requests uses up the shared bucket. The hospital gets `429` for doing nothing wrong. | One bucket **per tenant**, sized by plan |
+| 13 | **Limit evasion:** limit per *user*, ignoring the plan | The free law firm's 2 users get 20 requests through. The plan allows 5. Add users, get more. | Key the limit by **tenant**, not user or API key |
+| 14 | **No quota** | A tenant past its monthly tokens keeps calling the model, and you pay for it | Check month-to-date tokens **before** every model call. Refuse with `429` + `Retry-After`. |
+| 15 | **Unmetered path** | Usage is recorded for new chats, not follow-ups. 3 model calls, 1 billed. | All calls go through `LLMGateway`, which meters in **its own transaction**, so a later crash can't roll back the bill |
+| 16 | **Fake admin + owner connection** | `X-Admin: true` makes anyone an admin, and the admin query runs as the table owner (BYPASSRLS) | A separate admin credential (checked with `hmac.compare_digest`) and a `billing_reader` role that sees **usage for all tenants but no documents** |
+
+### Design ideas worth stealing
+
+- **One gateway for every model call.** Rate limit, then quota, then call, then meter. You can't forget a step, because there's no other path. This is the same idea as `TenantRepo`.
+- **The usage ledger is append-only.** `app_user` has `INSERT` but no `UPDATE` or `DELETE`, so even SQL injection can't erase usage to dodge a bill.
+- **Least privilege per job.** The web app (`app_user`) sees one tenant's documents. Billing (`billing_reader`) sees all tenants' usage and no documents. Migrations (`lab_owner`) are never used at runtime.
+- **Plans are business data.** Phase 2 let every tenant read the whole `tenants` table. Now it holds plans ("the bank pays for enterprise"), so it gets RLS too. Check every table when you add a column.
+- **Unknown model = expensive.** `cost_usd()` prices an unrecognized model like Opus, never as free. A pricing gap should never turn into a free model.
+
+### Phase 3 exercises
+
+1. Fix the 5 problems in `phase3/leaky_app.py`. Run `python -m phase3.hunt leaky` after each one.
+2. **Multiple servers.** The rate limiter lives in memory, so 3 servers = 3× the limit. Move the buckets into Postgres (an `UPDATE … RETURNING` on a `rate_buckets` table) or Redis, so all servers share them.
+3. **The quota race.** Two requests can both pass the quota check and overshoot. Fix it with a *reservation*: insert a "pending" usage row for the worst case before the call, then correct it to the real numbers afterwards.
+4. **Per-user fairness.** A tenant-wide bucket stops one tenant from starving others, but one user can still starve their colleagues. Add a smaller per-user bucket *inside* the tenant bucket.
+5. **Real costs.** Run with `LAB_LLM=claude` and compare `/usage` against your Anthropic Console usage. Do they match? (Hint: think about prompt caching and failed calls.)
+
 ## Roadmap to production
 
-You've done **Phases 1 and 2**. Each phase adds one production concern, with leaks to find and tests to prove the fix.
+You've done **Phases 1, 2 and 3**. Each phase adds one production concern, with leaks to find and tests to prove the fix.
 
 | Phase | Topic | What you'd build and learn |
 |---|---|---|
 | ✅ 1 | **Isolation basics + RAG** | This lab: 10 leaks, an attack suite and tests |
 | ✅ 2 | **Database-enforced isolation** | Postgres + **Row-Level Security** + `pgvector`. See the Phase 2 section above. |
-| 3 | **Per-tenant limits and cost** | Rate limits and monthly token quotas per tenant ("noisy neighbor" protection). Record `usage.input_tokens`/`output_tokens` per request so you can bill each tenant. |
+| ✅ 3 | **Per-tenant limits and cost** | Rate limits, quotas, metering and billing. See the Phase 3 section above. |
 | 4 | **Prompt injection** | A document that says "ignore your instructions…". Learn what isolation does and doesn't protect you from (it limits the blast radius to one tenant). Add output checks for canaries. |
 | 5 | **Observability and audit** | Structured logs with `tenant_id` on every line, but **no document contents in logs**. An audit trail of who asked what. Traces for each `/ask`. |
 | 6 | **Evals** | An eval set per tenant: answer quality *and* isolation (did any answer contain a foreign canary?). Run it in CI before every deploy. |

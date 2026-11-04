@@ -64,10 +64,21 @@ def user_message(question: str, docs: list[dict]) -> str:
 
 # ---------- Models ----------
 
+def estimate_tokens(text: str) -> int:
+    """Rough rule of thumb: about 4 characters per token for English text."""
+    return max(1, len(text) // 4)
+
+
 class OfflineLLM:
     """Pretend model: quotes the best-matching sentence (and ref) from each retrieved doc."""
 
     name = "offline"
+
+    def answer_with_usage(self, tenant_id, system, history, question, docs) -> tuple[str, dict]:
+        """Returns (answer, usage). Usage is estimated, since there's no real model to count."""
+        text = self.answer(tenant_id, system, history, question, docs)
+        prompt = system + "".join(m["content"] for m in history) + user_message(question, docs)
+        return text, {"input_tokens": estimate_tokens(prompt), "output_tokens": estimate_tokens(text)}
 
     def answer(self, tenant_id: str, system: str, history: list[dict], question: str, docs: list[dict]) -> str:
         lines = [f"Answering for the {tenant_id} workspace."]
@@ -86,7 +97,7 @@ class ClaudeLLM:
     """Real model. Opus 5.5 at low effort is a sensible default for short document Q&A;
     override with LAB_CLAUDE_MODEL / LAB_CLAUDE_EFFORT."""
 
-    name = "claude"
+    name = "claude"  # replaced by the actual model ID in __init__, for billing
 
     def __init__(self):
         import anthropic  # imported here so the offline path doesn't need the package
@@ -95,8 +106,14 @@ class ClaudeLLM:
         self.client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
         self.model = os.environ.get("LAB_CLAUDE_MODEL", "claude-opus-5-5")
         self.effort = os.environ.get("LAB_CLAUDE_EFFORT", "low")
+        self.name = self.model
 
     def answer(self, tenant_id: str, system: str, history: list[dict], question: str, docs: list[dict]) -> str:
+        return self.answer_with_usage(tenant_id, system, history, question, docs)[0]
+
+    def answer_with_usage(self, tenant_id, system, history, question, docs) -> tuple[str, dict]:
+        """Returns (answer, usage) with the token counts Claude actually billed."""
+        no_usage = {"input_tokens": 0, "output_tokens": 0}
         messages = [{"role": m["role"], "content": m["content"]} for m in history]
         messages.append({"role": "user", "content": user_message(question, docs)})
         try:
@@ -118,14 +135,15 @@ class ClaudeLLM:
                 "Set ANTHROPIC_API_KEY, or unset LAB_LLM to use the free offline model."
             ) from e
         except self.anthropic.RateLimitError:
-            return "The assistant is busy right now. Please try again shortly."
+            return "The assistant is busy right now. Please try again shortly.", no_usage
         except self.anthropic.APIStatusError as e:
-            return f"The assistant failed (HTTP {e.status_code})."
+            return f"The assistant failed (HTTP {e.status_code}).", no_usage
         except self.anthropic.APIConnectionError:
-            return "The assistant could not be reached."
+            return "The assistant could not be reached.", no_usage
+        usage = {"input_tokens": resp.usage.input_tokens, "output_tokens": resp.usage.output_tokens}
         if resp.stop_reason == "refusal":
-            return "The assistant declined to answer this request."
-        return "".join(b.text for b in resp.content if b.type == "text")
+            return "The assistant declined to answer this request.", usage
+        return "".join(b.text for b in resp.content if b.type == "text"), usage
 
 
 def get_llm():
