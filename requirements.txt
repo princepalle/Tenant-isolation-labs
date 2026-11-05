@@ -6,3 +6,4 @@ pytest>=8
 anthropic>=2.5
 psycopg[binary]>=3.2
 psycopg_pool>=3.2
+pyjwt[crypto]>=2.8

@@ -36,6 +36,7 @@ If a hospital user ever sees `BANK-SECRET-…`, that's a leak, with no room for 
 | `phase4/` | An AI agent with tools vs. prompt injection. See the Phase 4 section below. |
 | `phase5/` | Logging and a tamper-evident audit trail. See the Phase 5 section below. |
 | `phase6/` | Evals and the release gate. `.github/workflows/ci.yml` runs it on every push. See the Phase 6 section below. |
+| `phase7/` | Real login, secrets, offboarding and export, the container and its smoke test. See the Phase 7 section below. |
 
 ## Setup
 
@@ -133,7 +134,7 @@ docker compose up -d            # Postgres 16 + pgvector
 python -m phase2.setup_db       # roles, schema, RLS policies, 60 docs with embeddings
 python -m phase2.rls_demo       # 6 RLS pitfalls, live
 python -m phase2.hunt           # 11 attacks vs. the leaky and secure Phase 2 apps
-pytest -q                       # 99 tests (the database ones skip if Postgres isn't running)
+pytest -q                       # 120 tests (the database ones skip if Postgres isn't running)
 ```
 
 Run the servers with `uvicorn phase2.leaky_app:app --port 8003` and `uvicorn phase2.secure_app:app --port 8004`.
@@ -467,16 +468,96 @@ That's ~100 agent runs, each with several model calls, so it **costs real money*
 4. **Flaky vs. real.** Real models aren't deterministic. Run the Claude eval three times. How far apart are the scores? Set the tolerance from that, not from a guess.
 5. **Protect `main`.** In GitHub's settings, require the CI check to pass before a pull request can merge. Now the gate actually blocks a deploy.
 
-## Roadmap to production
+## Phase 7: ship it
 
-You've done **Phases 1 to 6**. Each phase adds one production concern, with leaks to find and tests to prove the fix.
+The last mile: real login, real secrets, a container, and the operations every SaaS customer eventually asks for, "give me my data" and "delete my data".
 
-| Phase | Topic | What you'd build and learn |
+### Setup
+
+```bash
+python -m phase7.setup_db                         # Phase 5 database + membership checks + offboarding
+python -m phase7.idp init                         # dev IdP keys + a random admin token in ./secrets/ (git-ignored)
+python -m phase7.hunt                             # 6 checks vs. the leaky and secure Phase 7 apps
+
+uvicorn phase7.secure_app:app --port 8012
+TOKEN=$(python -m phase7.idp token hospital-alice)
+curl -H "Authorization: Bearer $TOKEN" localhost:8012/export
+```
+
+### Run it the way it would ship (container, production mode)
+
+```bash
+python -m phase7.idp init --db                    # also generates random database passwords
+docker compose --profile app build
+docker compose up -d --wait db
+docker compose --profile app run --rm app python -m phase7.setup_db   # sets those passwords on the roles
+docker compose --profile app up -d --wait app
+python -m phase7.smoke http://localhost:8000      # 10 checks over HTTP, like a real client
+docker compose --profile app down -v
+```
+
+(Stop any local Postgres first. It uses the same port 5432.)
+
+### What's in `phase7/`
+
+| File | What it is |
+|---|---|
+| `idp.py` | A stand-in identity provider (like Auth0/Okta/Entra): RSA keys, a published JWKS, short-lived tokens with `tenant` and `role` claims |
+| `auth.py` | **Start here.** JWT verification done properly, plus a live membership check on every request |
+| `settings.py` | Secrets from env vars or mounted files; refuses to start in production with missing or dev values; secrets hidden from `repr()` |
+| `schema.sql` | `auth_member()`, `offboard_tenant()`, and the `platform_ops` role that can run only that |
+| `offboarding.py` | The data inventory: which tables offboarding deletes, which it keeps and why, what export includes |
+| `secure_app.py` / `leaky_app.py` | The Phase 5 secure app + login, export, offboarding and health endpoints |
+| `checks.py` / `hunt.py` | One check per problem |
+| `smoke.py` | Smoke test for a running deployment |
+| `../Dockerfile`, `../docker-compose.yml` | The image (non-root, read-only, no secrets inside, health check) and a production-mode deployment |
+
+### The 6 problems
+
+| # | Problem (leaky app) | Fix (secure app) |
 |---|---|---|
-| ✅ 1 | **Isolation basics + RAG** | This lab: 10 leaks, an attack suite and tests |
-| ✅ 2 | **Database-enforced isolation** | Postgres + **Row-Level Security** + `pgvector`. See the Phase 2 section above. |
-| ✅ 3 | **Per-tenant limits and cost** | Rate limits, quotas, metering and billing. See the Phase 3 section above. |
-| ✅ 4 | **Prompt injection** | An agent with tools, attacked by planted documents. See the Phase 4 section above. |
-| ✅ 5 | **Observability and audit** | Structured logs, a tamper-evident audit trail, denied actions recorded. See the Phase 5 section above. |
-| ✅ 6 | **Evals** | Quality, isolation and injection suites, a release gate, and CI on every push. See the Phase 6 section above. |
-| 7 | **Ship it** | Real auth (JWT/OIDC with a tenant claim), secrets management, a container image and deploy pipeline behind the CI gate, and per-tenant data export and deletion. |
+| 26 | **Signature not checked** ("temporarily", while debugging the IdP). An attacker writes `{"tenant": "bank"}` and *is* the bank. | Verify with the published public keys only. **Pin the algorithm to RS256**; never take it from the token (`alg: none` is a classic). Unknown key id = reject. |
+| 27 | **Audience/issuer not checked.** A token minted by the same IdP for *another* app (the marketing site, where people pick their own company) works here. | Require `iss` = our IdP and `aud` = this API, plus every claim we rely on. |
+| 28 | **No expiry, no revocation.** Expired tokens work, and so do tokens of people who were deactivated. | 5-minute tokens, expiry enforced, and `auth_member()` on **every request**: a deactivated user or offboarded tenant is out on the next request. |
+| 29 | **Secrets in code.** A hard-coded admin token, identical in every environment, and production starts happily with it. | `Settings.load()`: every secret from env or a mounted file. In production, a missing secret or a dev value is a startup error. |
+| 30 | **Offboarding leaves data behind.** Deletes documents and users; email drafts, chats, files on disk and the customer's login all survive. | `offboard_tenant()` deletes every tenant table, pseudonymizes retained billing rows, marks the tenant offboarded; the app deletes the files. A test compares the inventory against **every table with a `tenant_id` column**, so a new table can't be forgotten. |
+| 31 | **Incomplete export.** "Export your data" returns documents only. | Export every table the tenant owns, read under RLS, for **tenant admins only**, and audit the export. |
+
+### Things to notice
+
+- **The token says who you were. The database says who you are now.** A valid signature proves the IdP issued the token *at some point*. Membership is checked live, because firing someone can't wait for their token to expire.
+- **Key rotation** (`test_key_rotation`): sign with the new key, keep publishing the old public key until its tokens expire, then drop it. Nobody gets logged out.
+- **Least privilege, one last time.** `app_user` serves requests, `auditor` reads audit trails, the billing role reads usage, `platform_ops` can only offboard, and `lab_owner` runs migrations and is **never** used at runtime.
+- **Retention is a decision, not an accident.** Offboarding keeps billing records (legally required; user names pseudonymized) and the audit trail (metadata only). Exercise 3 is about the uncomfortable part: the audit trail holds user names, and its hash chain makes them hard to erase.
+- **The container caught a bug the tests missed.** All 120 tests passed, but the first image crashed on startup: PyJWT had been installed locally but never added to `requirements.txt`. Building and running the real artifact in CI is what finds that class of bug.
+
+### CI now
+
+`.github/workflows/ci.yml` has two jobs:
+
+1. **test-and-gate**: all tests, every secure app vs. its attack suite (now including Phase 7), and the eval gate
+2. **image**: runs only if job 1 passed. Builds the image, deploys it in production mode with freshly generated secrets, and runs `phase7.smoke`.
+
+A real pipeline would then push the image to a registry and roll it out to staging, then production. That's left out because it needs a registry and an environment you control.
+
+### Phase 7 exercises
+
+1. Fix the 6 problems in `phase7/leaky_app.py`. Run `python -m phase7.hunt leaky` after each one.
+2. **A real IdP.** Create a free Auth0 or Okta dev tenant, add a `tenant` claim to its tokens (a "rule" or "action"), and point `LAB_JWT_ISSUER`, `LAB_JWT_AUDIENCE` and `LAB_JWKS` at it. Fetch the JWKS from its URL instead of a file, and cache it.
+3. **Erasing a person.** A user asks to be forgotten. Their name is in `audit_events`, and the hash chain makes editing it detectable. How would you design the audit trail so you can erase people without breaking it? (Hint: store a pseudonymous user id, with the id-to-name mapping in a separate table you *can* delete from.)
+4. **Rotate a secret.** Generate a new `app_db_password`, apply it, and restart the app without failing a request. What has to happen in which order?
+5. **Ship it for real.** Push the image to GitHub Container Registry in CI (only on `main`), and deploy it somewhere small (Fly.io, Render, a VM). Point `phase7.smoke` at it, using a separate, disposable environment, never real data.
+
+## Roadmap: done
+
+| Phase | Topic | Section |
+|---|---|---|
+| ✅ 1 | Isolation basics + RAG | The 10 leaks |
+| ✅ 2 | Database-enforced isolation (Postgres RLS + pgvector) | Phase 2 |
+| ✅ 3 | Per-tenant limits, quotas, metering and billing | Phase 3 |
+| ✅ 4 | Prompt injection against an agent with tools | Phase 4 |
+| ✅ 5 | Logging and a tamper-evident audit trail | Phase 5 |
+| ✅ 6 | Evals and a release gate in CI | Phase 6 |
+| ✅ 7 | Real login, secrets, offboarding/export, container + deploy pipeline | Phase 7 |
+
+**31 problems, each with a check that proves the fix.** The exercises at the end of each phase are where the real practice is: fix the leaky apps yourself, then go further than the secure versions do.

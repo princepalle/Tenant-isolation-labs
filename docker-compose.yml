@@ -1,6 +1,13 @@
-# Phase 2 database: Postgres 16 with the pgvector extension.
+# Phase 2+ database: Postgres 16 with the pgvector extension.
 #   docker compose up -d
-#   python -m phase2.setup_db
+#   python -m phase7.setup_db
+#
+# Phase 7, the app as it would ship (production mode, secrets mounted from ./secrets):
+#   python -m phase7.idp init --db
+#   docker compose --profile app build
+#   docker compose up -d --wait db
+#   docker compose --profile app run --rm app python -m phase7.setup_db
+#   docker compose --profile app up -d --wait app
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -12,3 +19,31 @@ services:
       test: ["CMD", "pg_isready", "-U", "postgres"]
       interval: 2s
       retries: 15
+
+  app:
+    profiles: ["app"]
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      LAB_PG_HOST: db
+      # Only setup_db uses the superuser connection; the app itself never does.
+      LAB_PG_ADMIN_DSN: postgresql://postgres:postgres@db:5432/postgres
+    secrets: [jwks, admin_token, app_db_password, ops_db_password, auditor_db_password]
+    volumes:
+      - appdata:/data
+    read_only: true          # the app can't modify its own code
+    tmpfs: [/tmp]
+    ports:
+      - "8000:8000"
+
+secrets:
+  jwks:                { file: ./secrets/jwks }
+  admin_token:         { file: ./secrets/admin_token }
+  app_db_password:     { file: ./secrets/app_db_password }
+  ops_db_password:     { file: ./secrets/ops_db_password }
+  auditor_db_password: { file: ./secrets/auditor_db_password }
+
+volumes:
+  appdata:

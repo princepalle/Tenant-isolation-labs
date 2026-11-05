@@ -52,7 +52,10 @@ class AuditedTools(SecureTools):
         return out
 
 
-def create_app(pool=None, agent=None, limiter=None, admin_token=None, side_pool=None) -> FastAPI:
+def create_app(pool=None, agent=None, limiter=None, admin_token=None, side_pool=None,
+               authenticate_fn=None, auditor_dsn=AUDITOR_DSN) -> FastAPI:
+    """authenticate_fn(authorization_header) -> {'name', 'tenant_id', ...}. Defaults to the lab's
+    simple bearer tokens; Phase 7 passes a JWT verifier instead."""
     app = FastAPI(title="Phase 5: logging and audit (secure)")
     install_rls_error_handler(app)
     pool = pool or make_pool()
@@ -68,7 +71,7 @@ def create_app(pool=None, agent=None, limiter=None, admin_token=None, side_pool=
     install_request_context(app, logger)
 
     def current_user(authorization: str | None = Header(None), x_tenant_id: str | None = Header(None)):
-        user = authenticate(pool, authorization)
+        user = authenticate_fn(authorization) if authenticate_fn else authenticate(pool, authorization)
         set_tenant(user["tenant_id"], user["name"])  # from here on, every log line names the tenant
         if x_tenant_id is not None and x_tenant_id != user["tenant_id"]:
             audit.record(side_pool, user["tenant_id"], user["name"], context()["request_id"],
@@ -152,7 +155,7 @@ def create_app(pool=None, agent=None, limiter=None, admin_token=None, side_pool=
 
     @app.get("/admin/audit/verify", dependencies=[Depends(require_admin)])
     def verify():
-        results = [audit.verify_chain(AUDITOR_DSN, t) for t in TENANTS]
+        results = [audit.verify_chain(auditor_dsn, t) for t in TENANTS]
         for res in results:
             if not res["ok"]:
                 log(logger, "security.audit_chain_broken", logging.ERROR, broken_tenant=res["tenant_id"],
@@ -162,7 +165,7 @@ def create_app(pool=None, agent=None, limiter=None, admin_token=None, side_pool=
     @app.get("/admin/security-events", dependencies=[Depends(require_admin)])
     def security_events():
         """Denied and blocked actions per tenant: the security team's dashboard query."""
-        with psycopg.connect(AUDITOR_DSN, row_factory=dict_row) as conn:
+        with psycopg.connect(auditor_dsn, row_factory=dict_row) as conn:
             return conn.execute(
                 "SELECT tenant_id, action, outcome, COUNT(*) AS n, MAX(created) AS last_seen"
                 " FROM audit_events WHERE outcome <> 'ok'"

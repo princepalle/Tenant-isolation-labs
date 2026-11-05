@@ -3,6 +3,8 @@
 # 1. Unit + integration tests (all phases) against a real Postgres with pgvector
 # 2. Every secure app must survive its phase's attack suite
 # 3. The eval gate: zero isolation leaks, zero injection damage, no quality or cost regression
+# 4. Only if all of that passes: build the container image, deploy it in production mode
+#    with freshly generated secrets, and smoke-test it over HTTP
 #
 # Uses the free offline models only. No API key, no cost, same result every run.
 name: CI
@@ -56,6 +58,7 @@ jobs:
           python -m phase3.hunt secure
           python -m phase4.hunt secure
           python -m phase5.hunt secure
+          python -m phase7.hunt secure
 
       - name: Eval gate
         run: python -m phase6.evals --gate --report eval-report.md
@@ -64,3 +67,41 @@ jobs:
         if: always()
         run: |
           if [ -f eval-report.md ]; then cat eval-report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+  image:
+    needs: test-and-gate          # no image unless the tests, attack suites and eval gate passed
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies (for minting test tokens and the smoke test)
+        run: pip install -r requirements.txt
+
+      - name: Generate throwaway production secrets
+        run: python -m phase7.idp init --db
+
+      - name: Build the image
+        run: docker compose --profile app build
+
+      - name: Deploy (production mode) and set up the database
+        run: |
+          docker compose up -d --wait db
+          docker compose --profile app run --rm app python -m phase7.setup_db
+          docker compose --profile app up -d --wait app
+
+      - name: Smoke test over HTTP
+        run: python -m phase7.smoke http://localhost:8000
+
+      - name: App logs
+        if: always()
+        run: docker compose --profile app logs app | tail -50
+
+      # A real pipeline would now push the image to a registry and roll it out
+      # (e.g. to staging, smoke test there, then production). Left out on purpose:
+      # it needs a registry and a target environment you control.
